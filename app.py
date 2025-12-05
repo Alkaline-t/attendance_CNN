@@ -499,12 +499,18 @@ def recognize_face():
         
         try:
             pred_label, conf = predict_with_model(clf, emb)
+            app.logger.info(f"Prediction result: label={pred_label}, confidence={conf}")
         except Exception as e:
             app.logger.error(f"prediction error: {e}")
             return jsonify({"recognized": False, "error":"prediction failed"}), 500
         
-        if pred_label is None or conf < 0.45:
-            return jsonify({"recognized": False, "confidence": float(conf), "error": "confidence too low"}), 200
+        if pred_label is None:
+            app.logger.warning(f"No match found. Best confidence: {conf}")
+            return jsonify({"recognized": False, "confidence": float(conf), "error": "No matching student found"}), 200
+        
+        if conf < 0.40:
+            app.logger.warning(f"Confidence too low: {conf} for student {pred_label}")
+            return jsonify({"recognized": False, "confidence": float(conf), "student_id": int(pred_label), "error": "Confidence too low - please try again"}), 200
         
         student_id = int(pred_label)
         

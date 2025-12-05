@@ -128,7 +128,7 @@ def extract_face_encoding(image_path_or_array):
             image = cv2.convertScaleAbs(image, alpha=1.5, beta=30)
             image = cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_RGB2BGR), cv2.COLOR_BGR2RGB)
         
-        face_locations = face_recognition.face_locations(image, model="hog", number_of_times_to_upsample=1)
+        face_locations = face_recognition.face_locations(image, model="cnn")
         
         if len(face_locations) == 0:
             face_locations = face_recognition.face_locations(image, model="hog", number_of_times_to_upsample=2)
@@ -165,7 +165,32 @@ def extract_embedding_for_image(stream_or_bytes, require_liveness=False, additio
                 return None, {"is_live": False, "reason": "Invalid image"}
             return None
         
-        encoding = extract_face_encoding(img)
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        brightness = np.mean(rgb_img)
+        if brightness < 100:
+            rgb_img = cv2.convertScaleAbs(rgb_img, alpha=1.5, beta=30)
+        elif brightness > 200:
+            rgb_img = cv2.convertScaleAbs(rgb_img, alpha=0.8, beta=-20)
+        
+        face_locations = face_recognition.face_locations(rgb_img, model="cnn")
+        
+        if len(face_locations) == 0:
+            face_locations = face_recognition.face_locations(rgb_img, model="hog", number_of_times_to_upsample=2)
+        
+        if len(face_locations) == 0:
+            if require_liveness:
+                return None, {"is_live": False, "reason": "No face detected"}
+            return None
+        
+        encodings = face_recognition.face_encodings(rgb_img, face_locations)
+        
+        if len(encodings) == 0:
+            if require_liveness:
+                return None, {"is_live": False, "reason": "No face encoding generated"}
+            return None
+        
+        encoding = encodings[0]
         
         if encoding is None:
             if require_liveness:
@@ -222,7 +247,7 @@ def load_model_if_exists():
         _model_cache = None
         return None
 
-def predict_with_model(model_data, face_encoding, tolerance=0.6):
+def predict_with_model(model_data, face_encoding, tolerance=0.5):
     try:
         if not model_data or 'encodings' not in model_data or 'labels' not in model_data:
             logger.error("Invalid model data")
@@ -282,7 +307,7 @@ def train_model_background(dataset_dir, progress_callback=None):
         for sid in student_dirs:
             if progress_callback:
                 pct = int((processed / total_students) * 60)
-                progress_callback(pct, f"Loading images: {processed}/{total_students}", "loading")
+                progress_callback(pct, f"Processing student {processed + 1}/{total_students}", "loading")
             
             folder = os.path.join(dataset_dir, sid)
             logger.info(f"Processing folder: {folder}")
@@ -337,7 +362,7 @@ def train_model_background(dataset_dir, progress_callback=None):
             return
 
         if progress_callback:
-            progress_callback(70, f"Preparing data: {len(encodings)} samples, {failed_images} failed", "preparing")
+            progress_callback(70, f"Preparing data: {len(encodings)} images from {total_students} students", "preparing")
 
         model_data = {
             'encodings': encodings,
@@ -366,8 +391,8 @@ def train_model_background(dataset_dir, progress_callback=None):
         gc.collect()
 
         if progress_callback:
-            progress_callback(100, f"Training complete. Processed: {processed_images}, Failed: {failed_images}", "complete")
-        logger.info(f"Training complete. Processed: {processed_images}, Failed: {failed_images}")
+            progress_callback(100, f"Training complete! {processed_images} images from {total_students} students. Failed: {failed_images}", "complete")
+        logger.info(f"Training complete. Images: {processed_images}, Students: {total_students}, Failed: {failed_images}")
 
     except Exception as e:
         logger.error(f"Critical error in training: {e}")
