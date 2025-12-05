@@ -1,0 +1,419 @@
+import os
+import pickle
+import gc
+import logging
+import time
+
+import cv2
+import numpy as np
+import face_recognition
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def detect_liveness(image_frames, face_locations_list):
+    """
+    Detect if the person is physically present (not a photo/video).
+    Checks for:
+    1. Multiple frames with face detected
+    2. Face position variation (natural head movement)
+    3. Lighting/texture variations
+    4. Face size consistency (no zoom patterns from screen)
+    
+    Returns: (is_live: bool, confidence: float, reason: str)
+    """
+    if len(image_frames) < 3:
+        return False, 0.0, "Insufficient frames for liveness detection"
+    
+    if len(face_locations_list) < 3:
+        return False, 0.0, "Face not detected consistently"
+    
+    try:
+        # Check 1: Face position variation (natural micro-movements)
+        positions = []
+        sizes = []
+        for (top, right, bottom, left) in face_locations_list:
+            center_x = (left + right) / 2
+            center_y = (top + bottom) / 2
+            size = (right - left) * (bottom - top)
+            positions.append([center_x, center_y])
+            sizes.append(size)
+        
+        positions = np.array(positions)
+        sizes = np.array(sizes)
+        
+        # Calculate movement variance
+        position_variance = np.var(positions, axis=0).sum()
+        size_variance = np.var(sizes)
+        
+        # Natural head movement should have some variance but not too much
+        # Too little = static photo, too much = video playback or intentional movement
+        if position_variance < 5:  # Too static (printed photo)
+            return False, 0.0, "No natural head movement detected (static image)"
+        
+        if position_variance > 5000:  # Too much movement (video replay or screen)
+            return False, 0.0, "Excessive movement detected (possible video replay)"
+        
+        # Check 2: Texture analysis - photos have uniform texture, real faces have variance
+        texture_scores = []
+        for frame in image_frames:
+            if frame is None or frame.size == 0:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            # Calculate Laplacian variance (texture complexity)
+            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+            texture_scores.append(laplacian_var)
+        
+        if len(texture_scores) > 0:
+            avg_texture = np.mean(texture_scores)
+            # Real faces should have good texture detail
+            if avg_texture < 50:  # Very smooth = printed photo or low quality screen
+                return False, 0.0, "Low texture complexity (possible printed photo)"
+        
+        # Check 3: Lighting variation - real faces have subtle lighting changes
+        brightness_values = []
+        for frame in image_frames:
+            if frame is None or frame.size == 0:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            brightness_values.append(np.mean(gray))
+        
+        if len(brightness_values) >= 3:
+            brightness_variance = np.var(brightness_values)
+            # Natural lighting has some variation
+            if brightness_variance < 1:  # Too uniform = static image
+                return False, 0.0, "No lighting variation detected"
+        
+        # Check 4: Face size consistency (real face vs zoomed screen)
+        if len(sizes) >= 3:
+            size_std = np.std(sizes)
+            size_mean = np.mean(sizes)
+            size_cv = size_std / size_mean if size_mean > 0 else 0
+            
+            # Real faces have minimal size variation at same distance
+            # Video replay often shows size changes from zoom or phone movement
+            if size_cv > 0.15:  # Size varies too much
+                return False, 0.0, "Inconsistent face size (possible screen display)"
+        
+        # All checks passed
+        confidence = min(1.0, position_variance / 1000.0)  # Normalize to 0-1
+        return True, confidence, "Liveness verified"
+        
+    except Exception as e:
+        logger.error(f"Liveness detection error: {e}")
+        return False, 0.0, f"Liveness detection failed: {str(e)}"
+
+def analyze_frame_sequence(frames):
+    """
+    Analyze a sequence of frames for liveness detection.
+    Returns face locations and validity.
+    """
+    face_locations_list = []
+    valid_frames = []
+    
+    for frame in frames:
+        if frame is None or frame.size == 0:
+            continue
+        
+        # Detect faces in this frame
+        face_locations = face_recognition.face_locations(frame)
+        
+        if len(face_locations) == 1:  # Exactly one face
+            face_locations_list.append(face_locations[0])
+            valid_frames.append(frame)
+        elif len(face_locations) > 1:
+            logger.warning("Multiple faces detected in frame")
+        else:
+            logger.warning("No face detected in frame")
+    
+    return valid_frames, face_locations_list
+
+MODEL_PATH = "model.pkl"
+_model_cache = None
+
+def extract_face_encoding(image_path_or_array):
+    """
+    Extract 128-dimensional face encoding using face_recognition library.
+    Returns the encoding or None if no face is found.
+    """
+    try:
+        # Load image if path is provided, otherwise use array
+        if isinstance(image_path_or_array, str):
+            image = face_recognition.load_image_file(image_path_or_array)
+        else:
+            # Convert BGR to RGB if it's a cv2 image
+            if len(image_path_or_array.shape) == 3 and image_path_or_array.shape[2] == 3:
+                image = cv2.cvtColor(image_path_or_array, cv2.COLOR_BGR2RGB)
+            else:
+                image = image_path_or_array
+        
+        # Get face encodings (128-dimensional vectors)
+        encodings = face_recognition.face_encodings(image)
+        
+        if len(encodings) > 0:
+            # Return the first face encoding found
+            return encodings[0]
+        else:
+            logger.warning("No face detected in image")
+            return None
+    except Exception as e:
+        logger.error(f"Error extracting face encoding: {e}")
+        return None
+
+def extract_embedding_for_image(stream_or_bytes, require_liveness=False, additional_frames=None):
+    """
+    Extract face encoding from uploaded image stream or bytes.
+    Uses face_recognition library.
+    
+    Args:
+        stream_or_bytes: Image data stream or bytes
+        require_liveness: If True, perform liveness detection
+        additional_frames: List of additional frames for liveness detection
+    
+    Returns:
+        If require_liveness=False: encoding or None
+        If require_liveness=True: (encoding, liveness_result) or (None, error_dict)
+    """
+    data = None
+    arr = None
+    img = None
+    try:
+        data = stream_or_bytes.read()
+        if not data:
+            if require_liveness:
+                return None, {"is_live": False, "reason": "No image data"}
+            return None
+        arr = np.frombuffer(data, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            if require_liveness:
+                return None, {"is_live": False, "reason": "Invalid image"}
+            return None
+        
+        # Use face_recognition library
+        encoding = extract_face_encoding(img)
+        
+        if encoding is None:
+            if require_liveness:
+                return None, {"is_live": False, "reason": "No face detected"}
+            return None
+        
+        # Perform liveness detection if requested
+        if require_liveness and additional_frames:
+            all_frames = [img] + additional_frames
+            valid_frames, face_locations = analyze_frame_sequence(all_frames)
+            
+            is_live, confidence, reason = detect_liveness(valid_frames, face_locations)
+            
+            liveness_result = {
+                "is_live": is_live,
+                "confidence": confidence,
+                "reason": reason
+            }
+            
+            if not is_live:
+                return None, liveness_result
+            
+            return encoding, liveness_result
+        
+        if require_liveness:
+            return encoding, {"is_live": True, "confidence": 1.0, "reason": "Single frame mode"}
+        
+        return encoding
+    except Exception as e:
+        logger.error(f"Error in extract_embedding_for_image: {e}")
+        if require_liveness:
+            return None, {"is_live": False, "reason": f"Error: {str(e)}"}
+        return None
+    finally:
+        del data
+        del arr
+        del img
+        gc.collect()
+
+def load_model_if_exists():
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
+    
+    if not os.path.exists(MODEL_PATH):
+        return None
+    
+    try:
+        with open(MODEL_PATH, "rb") as f:
+            _model_cache = pickle.load(f)
+        logger.info("Model loaded successfully")
+        return _model_cache
+    except Exception as e:
+        logger.error(f"Error loading model: {e}")
+        _model_cache = None
+        return None
+
+def predict_with_model(model_data, face_encoding, tolerance=0.6):
+    """
+    Predict identity using face encodings and distance-based matching.
+    model_data is a dict with:
+        - 'encodings': list of known face encodings
+        - 'labels': list of corresponding student IDs
+    """
+    try:
+        if not model_data or 'encodings' not in model_data or 'labels' not in model_data:
+            logger.error("Invalid model data")
+            return None, 0.0
+        
+        known_encodings = model_data['encodings']
+        known_labels = model_data['labels']
+        
+        if len(known_encodings) == 0:
+            logger.warning("No known encodings in model")
+            return None, 0.0
+        
+        # Calculate face distances
+        distances = face_recognition.face_distance(known_encodings, face_encoding)
+        
+        # Find the best match
+        min_distance_idx = np.argmin(distances)
+        min_distance = distances[min_distance_idx]
+        
+        # Check if the distance is within tolerance
+        if min_distance <= tolerance:
+            label = known_labels[min_distance_idx]
+            # Convert distance to confidence score (0 distance = 1.0 confidence)
+            confidence = 1.0 - min_distance
+            return label, float(confidence)
+        else:
+            logger.warning(f"No match found. Minimum distance: {min_distance}")
+            return None, 0.0
+    except Exception as e:
+        logger.error(f"Error in prediction: {e}")
+        raise
+
+def train_model_background(dataset_dir, progress_callback=None):
+    """
+    Train the face recognition model using face_recognition library.
+    Generates 128-dimensional encodings for all student images.
+    """
+    encodings = []
+    labels = []
+    failed_images = 0
+    processed_images = 0
+    
+    try:
+        if progress_callback:
+            progress_callback(5, "Scanning dataset", "scanning")
+        
+        if not os.path.exists(dataset_dir):
+            logger.error(f"Dataset directory does not exist: {dataset_dir}")
+            if progress_callback:
+                progress_callback(0, "No training data found", "error")
+            return
+        
+        student_dirs = [d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))]
+        logger.info(f"Found student directories: {student_dirs}")
+        
+        if not student_dirs:
+            logger.error("No student directories found in dataset")
+            if progress_callback:
+                progress_callback(0, "No training data found", "error")
+            return
+        
+        total_students = len(student_dirs)
+        processed = 0
+
+        for sid in student_dirs:
+            if progress_callback:
+                pct = int((processed / total_students) * 60)
+                progress_callback(pct, f"Loading images: {processed}/{total_students}", "loading")
+            
+            folder = os.path.join(dataset_dir, sid)
+            logger.info(f"Processing folder: {folder}")
+            try:
+                files = [f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+                logger.info(f"Found {len(files)} image files in {folder}")
+            except Exception as e:
+                logger.error(f"Error reading folder {folder}: {e}")
+                processed += 1
+                continue
+            
+            if not files:
+                logger.warning(f"No image files found in {folder}")
+                processed += 1
+                continue
+            
+            for fn in files:
+                path = os.path.join(folder, fn)
+                img = None
+                try:
+                    logger.info(f"Processing image: {path}")
+                    img = cv2.imread(path)
+                    if img is None:
+                        logger.warning(f"Failed to read image: {path}")
+                        failed_images += 1
+                        continue
+                    
+                    # Extract face encoding using face_recognition
+                    encoding = extract_face_encoding(img)
+                    
+                    if encoding is not None:
+                        processed_images += 1
+                        encodings.append(encoding)
+                        labels.append(sid)
+                        logger.info(f"Successfully processed {fn} for student {sid}")
+                    else:
+                        logger.warning(f"No face detected in {fn}")
+                        failed_images += 1
+                except Exception as e:
+                    logger.error(f"Error processing {path}: {e}")
+                    failed_images += 1
+                    continue
+                finally:
+                    del img
+                    gc.collect()
+            
+            processed += 1
+
+        if len(encodings) < 1:
+            logger.error("No valid face encodings found")
+            if progress_callback:
+                progress_callback(0, "No training data found", "error")
+            return
+
+        if progress_callback:
+            progress_callback(70, f"Preparing data: {len(encodings)} samples, {failed_images} failed", "preparing")
+
+        # Create model data structure
+        model_data = {
+            'encodings': encodings,
+            'labels': labels
+        }
+
+        if progress_callback:
+            progress_callback(90, "Saving model", "saving")
+
+        try:
+            with open(MODEL_PATH, "wb") as f:
+                pickle.dump(model_data, f)
+            logger.info("Model saved successfully")
+        except Exception as e:
+            logger.error(f"Error saving model: {e}")
+            if progress_callback:
+                progress_callback(0, "Error saving model", "error")
+            return
+
+        global _model_cache
+        _model_cache = model_data
+
+        del encodings
+        del labels
+        del model_data
+        gc.collect()
+
+        if progress_callback:
+            progress_callback(100, f"Training complete. Processed: {processed_images}, Failed: {failed_images}", "complete")
+        logger.info(f"Training complete. Processed: {processed_images}, Failed: {failed_images}")
+
+    except Exception as e:
+        logger.error(f"Critical error in training: {e}")
+        if progress_callback:
+            progress_callback(0, "Training error", "error")
+
