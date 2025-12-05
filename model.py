@@ -379,6 +379,13 @@ def train_model_background(dataset_dir, progress_callback=None):
         if progress_callback:
             progress_callback(70, f"Preparing data: {len(encodings)} images from {total_students} students", "preparing")
 
+        logger.info(f"Total encodings created: {len(encodings)}")
+        logger.info(f"Total unique students: {len(set(labels))}")
+        
+        for sid in set(labels):
+            count = labels.count(sid)
+            logger.info(f"Student {sid}: {count} images processed")
+
         model_data = {
             'encodings': encodings,
             'labels': labels
@@ -406,8 +413,9 @@ def train_model_background(dataset_dir, progress_callback=None):
         gc.collect()
 
         if progress_callback:
-            progress_callback(100, f"Training complete! {processed_images} images from {total_students} students. Failed: {failed_images}", "complete")
+            progress_callback(100, f"Training complete! {processed_images} images from {total_students} students (Failed: {failed_images})", "complete")
         logger.info(f"Training complete. Images: {processed_images}, Students: {total_students}, Failed: {failed_images}")
+        logger.info(f"Model contains {len(encodings)} encodings")
 
     except Exception as e:
         logger.error(f"Critical error in training: {e}")
