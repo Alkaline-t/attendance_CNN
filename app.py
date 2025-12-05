@@ -22,6 +22,7 @@ LOCAL_TZ = pytz.timezone('Asia/Kolkata')
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config['JSON_SORT_KEYS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit for high-res phone images
 
 def get_db():
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -178,9 +179,26 @@ def upload_face():
             app.logger.info("Processing file: %s", file.filename)
             file_bytes = file.read()
             app.logger.info("File size: %d bytes", len(file_bytes))
+            
+            # Compress large images from phone cameras
             img = Image.open(io.BytesIO(file_bytes))
             if img.mode != "RGB":
                 img = img.convert("RGB")
+            
+            # Resize if too large (phone cameras often produce 4000x3000+ images)
+            max_dimension = 1920
+            if img.width > max_dimension or img.height > max_dimension:
+                ratio = min(max_dimension / img.width, max_dimension / img.height)
+                new_size = (int(img.width * ratio), int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+                app.logger.info("Resized image to: %dx%d", img.width, img.height)
+            
+            # Save compressed version
+            compressed_buffer = io.BytesIO()
+            img.save(compressed_buffer, format='JPEG', quality=85, optimize=True)
+            file_bytes = compressed_buffer.getvalue()
+            app.logger.info("Compressed size: %d bytes", len(file_bytes))
+            
             img_array = np.array(img)
             img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
             
