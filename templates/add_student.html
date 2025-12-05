@@ -498,7 +498,7 @@
                     <i class="fas fa-cloud-upload-alt upload-icon"></i>
                     <h4 style="color: #4a5568; margin-bottom: 8px;">Drag & Drop or Click to Upload</h4>
                     <p style="color: #718096; font-size: 14px;">Support: JPG, PNG (Multiple files)</p>
-                    <input type="file" id="uploadInput" accept=".jpg,.jpeg,.png,.heic" multiple style="display: none;" />
+                    <input type="file" id="uploadInput" accept="image/jpeg,image/jpg,image/png" multiple style="display: none;" />
                 </div>
 
                 <div class="file-count" id="fileCount" style="display: none;"></div>
@@ -572,15 +572,30 @@
         document.getElementById('captureBtn').addEventListener('click', async () => {
             const video = document.getElementById('cameraVideo');
             const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
+            
+            let width = video.videoWidth;
+            let height = video.videoHeight;
+            
+            const maxDimension = 1280;
+            if (width > maxDimension || height > maxDimension) {
+                if (width > height) {
+                    height = (height / width) * maxDimension;
+                    width = maxDimension;
+                } else {
+                    width = (width / height) * maxDimension;
+                    height = maxDimension;
+                }
+            }
+            
+            canvas.width = width;
+            canvas.height = height;
             const ctx = canvas.getContext('2d');
             
             ctx.translate(canvas.width, 0);
             ctx.scale(-1, 1);
-            ctx.drawImage(video, 0, 0);
+            ctx.drawImage(video, 0, 0, width, height);
             
-            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+            const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.75));
             const file = new File([blob], `camera_${Date.now()}.jpg`, { type: 'image/jpeg' });
             
             selectedFiles.push(file);
@@ -600,8 +615,7 @@
                         let width = img.width;
                         let height = img.height;
                         
-                        // Resize if too large
-                        const maxDimension = 1920;
+                        const maxDimension = 1280;
                         if (width > maxDimension || height > maxDimension) {
                             if (width > height) {
                                 height = (height / width) * maxDimension;
@@ -623,7 +637,7 @@
                                 lastModified: Date.now()
                             });
                             resolve(compressedFile);
-                        }, 'image/jpeg', 0.85);
+                        }, 'image/jpeg', 0.70);
                     };
                     img.src = e.target.result;
                 };
@@ -730,10 +744,16 @@
             formData.append('reg_no', reg_no);
 
             try {
-                const response = await fetch('/add_student', {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 120000);
+                
+                const response = await fetch('/upload_face', {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    signal: controller.signal
                 });
+                
+                clearTimeout(timeoutId);
 
                 if (!response.ok) {
                     const contentType = response.headers.get('content-type');
@@ -795,13 +815,19 @@
                 return;
             }
 
-            showNotification('Compressing and validating images...', 'info');
+            showNotification(`Compressing ${imageFiles.length} image(s)...`, 'info');
             
+            let processedCount = 0;
             for (let i = 0; i < imageFiles.length; i++) {
                 try {
                     const compressedFile = await compressImage(imageFiles[i]);
+                    const sizeMB = (compressedFile.size / (1024 * 1024)).toFixed(2);
+                    app.logger.info(`Compressed ${imageFiles[i].name} to ${sizeMB}MB`);
                     selectedFiles.push(compressedFile);
+                    processedCount++;
+                    showNotification(`Processing ${processedCount}/${imageFiles.length}...`, 'info');
                 } catch (err) {
+                    console.error('Compression error:', err);
                     showNotification(`Failed to process ${imageFiles[i].name}`, 'error');
                 }
             }
@@ -809,7 +835,10 @@
             updatePreview();
             
             document.getElementById('nextStep2').disabled = selectedFiles.length === 0;
-            showNotification(`${selectedFiles.length} image(s) ready`, 'success');
+            
+            const totalSize = selectedFiles.reduce((sum, f) => sum + f.size, 0);
+            const totalSizeMB = (totalSize / (1024 * 1024)).toFixed(2);
+            showNotification(`${selectedFiles.length} image(s) ready (${totalSizeMB}MB total)`, 'success');
         }
 
         function updatePreview() {
@@ -869,10 +898,16 @@
             });
 
             try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 120000);
+                
                 const response = await fetch('/upload_face', {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    signal: controller.signal
                 });
+                
+                clearTimeout(timeoutId);
 
                 if (!response.ok) {
                     const contentType = response.headers.get('content-type');
@@ -893,7 +928,13 @@
                     `${tempData.name} has been successfully registered with ${data.saved} photos`;
                 goToStep(3);
             } catch (error) {
-                showNotification('Error: ' + error.message, 'error');
+                if (error.name === 'AbortError') {
+                    showNotification('Upload timeout. Please try with fewer/smaller images.', 'error');
+                } else if (error.message.includes('Failed to fetch')) {
+                    showNotification('Network error. Please check your connection and try again.', 'error');
+                } else {
+                    showNotification('Error: ' + error.message, 'error');
+                }
                 btn.disabled = false;
                 btn.innerHTML = 'Upload & Register <i class="fas fa-check"></i>';
             }

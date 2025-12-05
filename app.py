@@ -23,6 +23,7 @@ LOCAL_TZ = pytz.timezone('Asia/Kolkata')
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config['JSON_SORT_KEYS'] = False
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 @app.errorhandler(413)
 def request_entity_too_large(error):
