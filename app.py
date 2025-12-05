@@ -244,7 +244,7 @@ def upload_face():
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
             
-            if laplacian_var < 20:
+            if laplacian_var < 5:
                 return jsonify({
                     "error": f"{file.filename} appears to be AI-generated or animated. Please use real photos only."
                 }), 400
@@ -253,7 +253,7 @@ def upload_face():
             hist = cv2.normalize(hist, hist).flatten()
             unique_colors = np.count_nonzero(hist > 0.001)
             
-            if unique_colors < 50:
+            if unique_colors < 25:
                 return jsonify({
                     "error": f"{file.filename} appears to be animated or cartoon. Please use real photos only."
                 }), 400
