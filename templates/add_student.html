@@ -745,9 +745,9 @@
 
             try {
                 const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 120000);
+                const timeoutId = setTimeout(() => controller.abort(), 30000);
                 
-                const response = await fetch('/upload_face', {
+                const response = await fetch('/add_student', {
                     method: 'POST',
                     body: formData,
                     signal: controller.signal
