@@ -11,6 +11,10 @@ import cv2
 from PIL import Image
 from flask import Flask, render_template, request, jsonify, send_file
 from model import train_model_background, extract_embedding_for_image, MODEL_PATH, load_model_if_exists, predict_with_model, extract_face_encoding
+import google.generativeai as genai
+
+GEMINI_API_KEY = "AIzaSyCXDyeFTbuaQm1qtqdgYdSjx3Uf0x98tU0"
+genai.configure(api_key=GEMINI_API_KEY)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "attendance.db")
@@ -202,6 +206,8 @@ def upload_face():
     all_embeddings = []
     skipped_files = []
     
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
     for file in files:
         if not file or file.filename == "":
             app.logger.warning("Skipping empty file")
@@ -214,6 +220,18 @@ def upload_face():
             img = Image.open(io.BytesIO(file_bytes))
             if img.mode != "RGB":
                 img = img.convert("RGB")
+            
+            try:
+                prompt = "Is this a real human face photo? Answer only YES or NO. If it's a drawing, animation, cartoon, AI-generated, or fake image, say NO."
+                response = model.generate_content([prompt, img])
+                gemini_result = response.text.strip().upper()
+                app.logger.info(f"Gemini validation for {file.filename}: {gemini_result}")
+                
+                if "NO" in gemini_result:
+                    skipped_files.append(f"{file.filename} (not a real human face)")
+                    continue
+            except Exception as gemini_error:
+                app.logger.warning(f"Gemini validation failed: {gemini_error}, proceeding with basic checks")
             
             img_array = np.array(img)
             img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
@@ -237,20 +255,6 @@ def upload_face():
             elif len(faces) > 1:
                 app.logger.warning("Multiple faces detected in: %s", file.filename)
                 skipped_files.append(f"{file.filename} (multiple faces)")
-                continue
-            
-            laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-            
-            if laplacian_var < 3:
-                skipped_files.append(f"{file.filename} (AI/animated)")
-                continue
-            
-            hist = cv2.calcHist([img_bgr], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-            unique_colors = np.count_nonzero(hist > 0.001)
-            
-            if unique_colors < 20:
-                skipped_files.append(f"{file.filename} (cartoon/animated)")
                 continue
             
             encoding = extract_face_encoding(img_bgr)
