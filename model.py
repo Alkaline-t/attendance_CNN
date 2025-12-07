@@ -3,6 +3,7 @@ import pickle
 import gc
 import logging
 import time
+from collections import deque, Counter
 
 import cv2
 import numpy as np
@@ -10,6 +11,10 @@ from deepface import DeepFace
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+_temporal_buffer = deque(maxlen=10)
+_recognized_cache = {}
+_cache_timeout = 30
 
 def detect_liveness(image_frames, face_locations_list):
     if len(image_frames) < 2:
@@ -114,6 +119,85 @@ def analyze_frame_sequence(frames):
 
 MODEL_PATH = "model.pkl"
 _model_cache = None
+
+def augment_image(img):
+    """
+    Generate augmented variations of an image to simulate different conditions.
+    Returns list of augmented images.
+    """
+    augmented = []
+    h, w = img.shape[:2]
+    
+    augmented.append(img.copy())
+    
+    brightness_variations = [0.85, 1.0, 1.15]
+    contrast_variations = [0.9, 1.0, 1.1]
+    
+    for brightness in brightness_variations:
+        for contrast in contrast_variations:
+            adjusted = cv2.convertScaleAbs(img, alpha=contrast, beta=(brightness - 1) * 50)
+            augmented.append(adjusted)
+    
+    blur_kernel = (3, 3)
+    blurred = cv2.GaussianBlur(img, blur_kernel, 0)
+    augmented.append(blurred)
+    
+    noise = np.random.normal(0, 5, img.shape).astype(np.uint8)
+    noisy = cv2.add(img, noise)
+    augmented.append(noisy)
+    
+    for angle in [-5, 5]:
+        center = (w // 2, h // 2)
+        matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(img, matrix, (w, h))
+        augmented.append(rotated)
+    
+    sharpening_kernel = np.array([[-1,-1,-1], [-1, 9,-1], [-1,-1,-1]])
+    sharpened = cv2.filter2D(img, -1, sharpening_kernel)
+    augmented.append(sharpened)
+    
+    return augmented
+
+def extract_embeddings_from_augmented(img):
+    """
+    Extract multiple embeddings from augmented versions of an image.
+    Returns list of embeddings and the centroid.
+    """
+    augmented_images = augment_image(img)
+    embeddings = []
+    
+    for aug_img in augmented_images:
+        try:
+            result = DeepFace.represent(
+                img_path=aug_img,
+                model_name='ArcFace',
+                enforce_detection=False,
+                detector_backend='retinaface',
+                align=True
+            )
+            if result and len(result) > 0:
+                embeddings.append(np.array(result[0]['embedding']))
+        except:
+            try:
+                result = DeepFace.represent(
+                    img_path=aug_img,
+                    model_name='ArcFace',
+                    enforce_detection=False,
+                    detector_backend='opencv',
+                    align=True
+                )
+                if result and len(result) > 0:
+                    embeddings.append(np.array(result[0]['embedding']))
+            except:
+                continue
+    
+    if len(embeddings) == 0:
+        return None, None
+    
+    embeddings_array = np.array(embeddings)
+    centroid = np.mean(embeddings_array, axis=0)
+    
+    return embeddings, centroid
 
 def extract_face_encoding(image_path_or_array):
     try:
@@ -280,17 +364,17 @@ def load_model_if_exists():
         _model_cache = None
         return None
 
-def predict_with_model(model_data, face_encoding, tolerance=0.65):
+def predict_with_model(model_data, face_encoding, tolerance=0.65, use_temporal=True):
     try:
-        if not model_data or 'encodings' not in model_data or 'labels' not in model_data:
+        if not model_data or 'centroids' not in model_data or 'labels' not in model_data:
             logger.error("Invalid model data")
             return None, 0.0
         
-        known_encodings = model_data['encodings']
+        known_centroids = model_data['centroids']
         known_labels = model_data['labels']
         
-        if len(known_encodings) == 0:
-            logger.warning("No known encodings in model")
+        if len(known_centroids) == 0:
+            logger.warning("No known centroids in model")
             return None, 0.0
         
         if face_encoding is None or len(face_encoding) == 0:
@@ -307,16 +391,16 @@ def predict_with_model(model_data, face_encoding, tolerance=0.65):
         best_similarity = -1
         second_best_similarity = -1
         
-        for idx, known_encoding in enumerate(known_encodings):
+        for idx, known_centroid in enumerate(known_centroids):
             try:
-                if known_encoding is None or len(known_encoding) == 0:
+                if known_centroid is None or len(known_centroid) == 0:
                     continue
                 
-                if len(known_encoding) != len(face_encoding):
-                    logger.warning(f"Encoding size mismatch: {len(known_encoding)} vs {len(face_encoding)}")
+                if len(known_centroid) != len(face_encoding):
+                    logger.warning(f"Encoding size mismatch: {len(known_centroid)} vs {len(face_encoding)}")
                     continue
                 
-                cosine_dist = distance.cosine(face_encoding, known_encoding)
+                cosine_dist = distance.cosine(face_encoding, known_centroid)
                 
                 if np.isnan(cosine_dist) or np.isinf(cosine_dist):
                     logger.warning(f"Invalid distance for encoding {idx}")
@@ -341,6 +425,24 @@ def predict_with_model(model_data, face_encoding, tolerance=0.65):
                 return None, float(best_similarity)
             
             label = known_labels[best_match_idx]
+            
+            if use_temporal:
+                global _temporal_buffer
+                _temporal_buffer.append(label)
+                
+                if len(_temporal_buffer) >= 5:
+                    counter = Counter(_temporal_buffer)
+                    most_common_label, count = counter.most_common(1)[0]
+                    
+                    if count >= 3:
+                        return most_common_label, float(best_similarity)
+                    else:
+                        logger.info(f"Temporal smoothing: waiting for stability. Current votes: {counter}")
+                        return None, float(best_similarity)
+                else:
+                    logger.info(f"Temporal buffer filling: {len(_temporal_buffer)}/5")
+                    return None, float(best_similarity)
+            
             return label, float(best_similarity)
         else:
             logger.warning(f"No match found. Best similarity: {best_similarity}")
@@ -349,8 +451,25 @@ def predict_with_model(model_data, face_encoding, tolerance=0.65):
         logger.error(f"Error in prediction: {e}")
         return None, 0.0
 
+def clear_temporal_buffer():
+    """Clear the temporal buffer for fresh recognition"""
+    global _temporal_buffer
+    _temporal_buffer.clear()
+
+def is_recently_recognized(student_id):
+    """Check if student was recently recognized to prevent duplicate entries"""
+    global _recognized_cache, _cache_timeout
+    current_time = time.time()
+    
+    if student_id in _recognized_cache:
+        if current_time - _recognized_cache[student_id] < _cache_timeout:
+            return True
+    
+    _recognized_cache[student_id] = current_time
+    return False
+
 def train_model_background(dataset_dir, progress_callback=None):
-    encodings = []
+    centroids = []
     labels = []
     failed_images = 0
     processed_images = 0
@@ -380,7 +499,7 @@ def train_model_background(dataset_dir, progress_callback=None):
         for sid in student_dirs:
             if progress_callback:
                 pct = int((processed / total_students) * 60)
-                progress_callback(pct, f"Processing student {processed + 1}/{total_students}", "loading")
+                progress_callback(pct, f"Processing student {processed + 1}/{total_students} with one-shot learning", "loading")
             
             folder = os.path.join(dataset_dir, sid)
             logger.info(f"Processing folder: {folder}")
@@ -397,65 +516,68 @@ def train_model_background(dataset_dir, progress_callback=None):
                 processed += 1
                 continue
             
-            for fn in files:
-                path = os.path.join(folder, fn)
-                img = None
-                try:
-                    logger.info(f"Processing image: {path}")
-                    img = cv2.imread(path)
-                    if img is None:
-                        logger.warning(f"Failed to read image: {path}")
-                        failed_images += 1
-                        continue
-                    
-                    encoding = extract_face_encoding(img)
-                    
-                    if encoding is not None:
-                        processed_images += 1
-                        encodings.append(encoding)
-                        labels.append(sid)
-                        logger.info(f"Successfully processed {fn} for student {sid}")
-                    else:
-                        logger.warning(f"No face detected in {fn} - skipping")
-                        failed_images += 1
-                except Exception as e:
-                    logger.error(f"Error processing {path}: {e}")
+            primary_image = files[0]
+            path = os.path.join(folder, primary_image)
+            img = None
+            try:
+                logger.info(f"Processing primary image for one-shot learning: {path}")
+                img = cv2.imread(path)
+                if img is None:
+                    logger.warning(f"Failed to read image: {path}")
                     failed_images += 1
-                finally:
-                    if img is not None:
-                        del img
-                    gc.collect()
+                    processed += 1
+                    continue
+                
+                logger.info(f"Generating augmented embeddings for student {sid}")
+                embeddings, centroid = extract_embeddings_from_augmented(img)
+                
+                if centroid is not None:
+                    processed_images += 1
+                    centroids.append(centroid)
+                    labels.append(sid)
+                    logger.info(f"Successfully created centroid from {len(embeddings) if embeddings else 0} augmented embeddings for student {sid}")
+                else:
+                    logger.warning(f"No face detected in {primary_image} - skipping student {sid}")
+                    failed_images += 1
+            except Exception as e:
+                logger.error(f"Error processing {path}: {e}")
+                failed_images += 1
+            finally:
+                if img is not None:
+                    del img
+                gc.collect()
             
             processed += 1
 
-        if len(encodings) < 1:
-            logger.error("No valid face encodings found")
+        if len(centroids) < 1:
+            logger.error("No valid face centroids found")
             if progress_callback:
                 progress_callback(0, "No training data found", "error")
             return
 
         if progress_callback:
-            progress_callback(70, f"Preparing data: {len(encodings)} images from {total_students} students", "preparing")
+            progress_callback(70, f"Preparing centroid model: {len(centroids)} students", "preparing")
 
-        logger.info(f"Total encodings created: {len(encodings)}")
+        logger.info(f"Total centroids created: {len(centroids)}")
         logger.info(f"Total unique students: {len(set(labels))}")
         
         for sid in set(labels):
             count = labels.count(sid)
-            logger.info(f"Student {sid}: {count} images processed")
+            logger.info(f"Student {sid}: centroid model created from augmented data")
 
         model_data = {
-            'encodings': encodings,
-            'labels': labels
+            'centroids': centroids,
+            'labels': labels,
+            'version': '2.0_oneshot_arcface'
         }
 
         if progress_callback:
-            progress_callback(90, "Saving model", "saving")
+            progress_callback(90, "Saving one-shot model", "saving")
 
         try:
             with open(MODEL_PATH, "wb") as f:
                 pickle.dump(model_data, f)
-            logger.info("Model saved successfully")
+            logger.info("One-shot centroid model saved successfully")
         except Exception as e:
             logger.error(f"Error saving model: {e}")
             if progress_callback:
@@ -465,17 +587,17 @@ def train_model_background(dataset_dir, progress_callback=None):
         global _model_cache
         _model_cache = model_data
 
-        total_encodings = len(encodings)
+        total_centroids = len(centroids)
         
-        del encodings
+        del centroids
         del labels
         del model_data
         gc.collect()
 
         if progress_callback:
-            progress_callback(100, f"Training complete! {processed_images} images from {total_students} students (Failed: {failed_images})", "complete")
-        logger.info(f"Training complete. Images: {processed_images}, Students: {total_students}, Failed: {failed_images}")
-        logger.info(f"Model contains {total_encodings} encodings")
+            progress_callback(100, f"One-shot training complete! {processed_images} students enrolled (Failed: {failed_images})", "complete")
+        logger.info(f"One-shot training complete. Students: {processed_images}, Failed: {failed_images}")
+        logger.info(f"Model contains {total_centroids} identity centroids")
 
     except Exception as e:
         logger.error(f"Critical error in training: {e}")
@@ -485,8 +607,8 @@ def train_model_background(dataset_dir, progress_callback=None):
             progress_callback(0, f"Training error: {str(e)}", "error")
     finally:
         try:
-            if 'encodings' in locals():
-                del encodings
+            if 'centroids' in locals():
+                del centroids
             if 'labels' in locals():
                 del labels
             if 'model_data' in locals():
