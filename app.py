@@ -10,7 +10,7 @@ import numpy as np
 import cv2
 from PIL import Image
 from flask import Flask, render_template, request, jsonify, send_file
-from model import train_model_background, extract_embedding_for_image, MODEL_PATH, load_model_if_exists, predict_with_model, extract_face_encoding, clear_temporal_buffer, is_recently_recognized
+from model import train_model_background, extract_embedding_for_image, MODEL_PATH, load_model_if_exists, predict_with_model, extract_face_encoding
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(APP_DIR, "attendance.db")
@@ -569,21 +569,13 @@ def recognize_face():
         
         if pred_label is None:
             app.logger.warning(f"No match found. Best confidence: {conf}")
-            clear_temporal_buffer()
-            return jsonify({"recognized": False, "confidence": float(conf), "error": "No matching student found - temporal buffer cleared"}), 200
+            return jsonify({"recognized": False, "confidence": float(conf), "error": "No matching student found"}), 200
         
-        if conf < 0.55:
+        if conf < 0.50:
             app.logger.warning(f"Confidence too low: {conf} for student {pred_label}")
-            return jsonify({"recognized": False, "confidence": float(conf), "student_id": int(pred_label), "error": "Confidence too low - please ensure proper lighting and face the camera directly"}), 200
-        
-        if conf < 0.65:
-            app.logger.info(f"Borderline confidence: {conf} for student {pred_label} - flagging for review")
+            return jsonify({"recognized": False, "confidence": float(conf), "student_id": int(pred_label), "error": "Confidence too low - please ensure proper lighting"}), 200
         
         student_id = int(pred_label)
-        
-        if is_recently_recognized(student_id):
-            app.logger.info(f"Student {student_id} was recently recognized, preventing duplicate entry")
-            return jsonify({"recognized": False, "error": "Recently marked present. Please wait before trying again."}), 200
         
         conn = get_db()
         try:
@@ -602,7 +594,6 @@ def recognize_face():
                     c.execute("""UPDATE attendance SET check_out_time = ? WHERE id = ?""",
                               (check_out_time, row[0]))
                     conn.commit()
-                    clear_temporal_buffer()
                     c.execute("SELECT name FROM students WHERE id=?", (student_id,))
                     name_row = c.fetchone()
                     name = name_row[0] if name_row else "Unknown"
@@ -642,8 +633,6 @@ def recognize_face():
                       (student_id, name, check_in_time, is_late, float(conf)))
             conn.commit()
             
-            clear_temporal_buffer()
-            
             return jsonify({
                 "recognized": True,
                 "student_id": student_id,
@@ -652,7 +641,7 @@ def recognize_face():
                 "status": "check_in",
                 "is_late": is_late,
                 "liveness": liveness_result,
-                "message": "Attendance marked successfully via one-shot ArcFace recognition"
+                "message": "Attendance marked successfully"
             }), 200
         except Exception as e:
             app.logger.error(f"attendance error: {e}")
